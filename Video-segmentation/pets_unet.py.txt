@@ -1,0 +1,339 @@
+import tensorflow as tf
+import tensorflow.compat.v2 as tf
+import tensorflow_datasets as tfds
+import matplotlib.pyplot as plt
+import numpy as np
+
+from tensorflow.keras.layers import Input, Conv2D, BatchNormalization, Activation, MaxPool2D, UpSampling2D, Concatenate
+from tensorflow.keras.models import Model
+
+
+dataset, info = tfds.load('oxford_iiit_pet:3.*.*', with_info=True)
+print(info)
+
+
+def random_flip(input_image, input_mask):
+  if tf.random.uniform(()) > 0.5:
+    input_image = tf.image.flip_left_right(input_image)
+    input_mask = tf.image.flip_left_right(input_mask)
+
+  return input_image, input_mask
+
+
+def normalize(input_image, input_mask):
+  input_image = tf.cast(input_image, tf.float32) / 255.0
+  input_mask -= 1
+  return input_image, input_mask
+
+
+@tf.function
+def load_image_train(datapoint):
+  '''resizes, normalizes, and flips the training data'''
+  input_image = tf.image.resize(datapoint['image'], (128, 128), method='nearest')
+  input_mask = tf.image.resize(datapoint['segmentation_mask'], (128, 128), method='nearest')
+  input_image, input_mask = random_flip(input_image, input_mask)
+  input_image, input_mask = normalize(input_image, input_mask)
+  
+  return input_image, input_mask
+
+def load_image_test(datapoint):
+  '''resizes and normalizes the test data'''
+  input_image = tf.image.resize(datapoint['image'], (128, 128), method='nearest')
+  input_mask = tf.image.resize(datapoint['segmentation_mask'], (128, 128), method='nearest')
+  input_image, input_mask = normalize(input_image, input_mask)
+
+  return input_image, input_mask
+
+train = dataset['train'].map(load_image_train, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+test = dataset['test'].map(load_image_test)
+
+
+BATCH_SIZE =20
+BUFFER_SIZE = 1000
+
+# shuffle and group the train set into batches
+train_dataset = train.cache().shuffle(BUFFER_SIZE).batch(BATCH_SIZE).repeat()
+# do a prefetch to optimize processing
+train_dataset = train_dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+# group the test set into batches
+test_dataset = test.batch(BATCH_SIZE)
+
+
+# class list of the mask pixels
+class_names = ['pet', 'background', 'outline']
+
+
+def display_with_metrics(display_list,iou_list):  
+  metrics_by_id = [(idx, iou) for idx, iou in enumerate(iou_list) if iou > 0.0]
+  metrics_by_id.sort(key=lambda tup: tup[1], reverse=True)  # sorts in place  
+  display_string_list = ["{}: IOU: {} ".format(class_names[idx], iou) for idx, iou in metrics_by_id]
+  display_string = "\n\n".join(display_string_list)
+
+  display(display_list, ["Image", "Predicted Mask", "True Mask"], display_string=display_string) 
+
+
+def display(display_list,titles=[], display_string=None):  
+  plt.figure(figsize=(8, 8))
+  for i in range(len(display_list)):
+    plt.subplot(1, len(display_list), i+1)
+    plt.title(titles[i])
+    plt.xticks([])
+    plt.yticks([])
+    if display_string and i == 1:
+      plt.xlabel(display_string, fontsize=12)
+    img_arr = tf.keras.preprocessing.image.array_to_img(display_list[i])
+    plt.imshow(img_arr)
+  
+  plt.show()
+
+
+def show(dataset,n):
+  '''displays the first image and its mask from a dataset'''
+  for image, mask in dataset.take(n):
+    sample_image, sample_mask = image, mask
+  display([sample_image, sample_mask], titles=["Image", "True Mask"])
+
+# from the train set
+show(train,24)
+
+# from the test set
+show(test,10)
+
+def conv2d_block(input_tensor, n_filters, kernel_size = 3, pooling=False, deconv=False):    
+    x = Conv2D(n_filters, kernel_size = (kernel_size, kernel_size), kernel_initializer = 'he_normal', padding="same")(input_tensor)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+
+    x = Conv2D(n_filters, kernel_size = (kernel_size, kernel_size),kernel_initializer = 'he_normal', padding="same")(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    
+    if pooling == True:
+        p = MaxPool2D((2, 2))(x)
+        p = tf.keras.layers.Dropout(0.3)(p)
+        return x, p
+    elif deconv == True:
+        d = tf.keras.layers.Conv2DTranspose(filters=n_filters, kernel_size = (3, 3),strides = 2, padding = 'same')(x)
+        return d
+    else:
+        return x
+
+def encoder(inputs): 
+  f1, p1 = conv2d_block(inputs, n_filters=64,kernel_size=3,pooling=True)  
+  print(p1)
+  f2, p2 = conv2d_block(p1, n_filters=128,kernel_size=3,pooling=True)
+  print(p2)  
+  f3, p3 = conv2d_block(p2, n_filters=256,kernel_size=3,pooling=True)  
+  print(p3)
+  f4, p4 = conv2d_block(p3, n_filters=512,kernel_size=3,pooling=True)  
+  print(p4)
+  return p4, (f1, f2, f3, f4)
+
+"""### Bottleneck
+
+
+A bottleneck follows the encoder block and is used to extract more features. 
+"""
+
+def bottleneck(inputs):  
+  #This function defines the bottleneck convolutions to extract more features before the upsampling layers.
+  bottle_neck = conv2d_block(inputs, n_filters=1024,deconv = True)   
+  print(bottle_neck)  
+  return bottle_neck
+
+"""### Decoder
+
+"""
+
+# Decoder Utilities
+def deconv2d_block(input_tensor, n_filters=64, kernel_size = 3, deconv=False):    
+    
+    x = Conv2D(n_filters, kernel_size = (kernel_size, kernel_size), kernel_initializer = 'he_normal', padding="same")(input_tensor)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)    
+    n_filters=n_filters/2    
+    x = Conv2D(n_filters, kernel_size = (kernel_size, kernel_size),kernel_initializer = 'he_normal', padding="same")(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)    
+    
+    if deconv == True:
+        d = tf.keras.layers.Conv2DTranspose(filters=n_filters, kernel_size = (3, 3),strides = 2, padding = 'same')(x)
+        return d
+    else:
+        return x
+
+def decoder_block(inputs, conv_output, n_filters=64, kernel_size=3, strides=3, dropout=0.3): 
+  c = tf.keras.layers.concatenate([inputs, conv_output])   
+  d = deconv2d_block(c, n_filters=n_filters, kernel_size=3,deconv= True)  
+  return d
+
+
+def decoder(inputs, convs, output_channels):  
+  f1, f2, f3, f4 = convs
+  f6 = decoder_block(inputs, f4, n_filters=1024,strides=2)
+  print(f6)
+  f7 = decoder_block(f6, f3,n_filters=512,strides=2)
+  print(f7)
+  f8 = decoder_block(f7, f2, n_filters=256,strides=2)
+  print(f8)  
+  f9 = decoder_block(f7, f2, n_filters=128,strides=2)
+  print(f9)  
+  
+  #As it is multiclass classsification we will use softmax
+  outputs = tf.keras.layers.Conv2D(output_channels, kernel_size=1, activation='softmax')(f9)
+  print(outputs )
+  return outputs
+
+def Unet(): 
+  inputs = tf.keras.layers.Input(shape=(128, 128,3,))
+  # Calling encoder block and taking convs features at each block
+  encoder_output, convs = encoder(inputs)
+  # feed the encoder output to the bottleneck
+  bottle_neck = bottleneck(encoder_output)  
+  # feed the bottleneck and encoder block outputs and passing the convs features to the decoder 
+  outputs = decoder(bottle_neck, convs, output_channels=3)  
+  # create the model
+  model = tf.keras.Model(inputs=inputs, outputs=outputs)
+  return model
+
+model = Unet()
+#model.summary()
+
+
+model.compile(optimizer=tf.keras.optimizers.Adam(), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+TRAIN_LENGTH = info.splits['train'].num_examples
+EPOCHS = 1
+VAL_SUBSPLITS = 5
+STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE
+VALIDATION_STEPS = info.splits['test'].num_examples//BATCH_SIZE//VAL_SUBSPLITS
+
+model_history = model.fit(train_dataset, epochs=EPOCHS,steps_per_epoch=STEPS_PER_EPOCH,validation_steps=VALIDATION_STEPS,validation_data=test_dataset)
+
+model.save("unet.h5")
+
+
+def get_test_image_and_annotation_arrays():
+  ds = test_dataset.unbatch()
+  ds = ds.batch(info.splits['test'].num_examples)
+  
+  images = []
+  y_true_segments = []
+
+  for image, annotation in ds.take(1):
+    y_true_segments = annotation.numpy()
+    images = image.numpy()
+  
+  y_true_segments = y_true_segments[:(info.splits['test'].num_examples - (info.splits['test'].num_examples % BATCH_SIZE))]
+  
+  return images[:(info.splits['test'].num_examples - (info.splits['test'].num_examples % BATCH_SIZE))], y_true_segments
+
+
+def create_mask(pred_mask):
+
+  pred_mask = tf.argmax(pred_mask, axis=-1)
+  pred_mask = pred_mask[..., tf.newaxis]
+  return pred_mask[0].numpy()
+
+
+def make_predictions(image, mask, num=1):
+
+  image = np.reshape(image,(1, image.shape[0], image.shape[1], image.shape[2]))
+  pred_mask = model.predict(image)
+  pred_mask = create_mask(pred_mask)
+  return pred_mask
+
+
+def class_iou(y_true, y_pred):
+  class_wise_iou = [] 
+  smoothening_factor = 0.00001
+  for i in range(3):    
+    intersection = np.sum((y_pred == i) * (y_true == i))
+    y_true_area = np.sum((y_true == i))
+    y_pred_area = np.sum((y_pred == i))
+    
+    combined_area = y_true_area + y_pred_area
+    
+    iou = (intersection + smoothening_factor) / (combined_area - intersection + smoothening_factor)
+    class_wise_iou.append(iou*100)   
+  return class_wise_iou
+
+
+# get the ground truth from the test set
+y_true_images, y_true_segments = get_test_image_and_annotation_arrays()
+# feed the test set to th emodel to get the predicted masks
+results = model.predict(test_dataset, steps=info.splits['test'].num_examples//BATCH_SIZE)
+results = np.argmax(results, axis=3)
+results = results[..., tf.newaxis]
+
+# compute the class wise metrics
+cls_wise_iou= class_iou(y_true_segments, results)
+
+# show the IOU for each class
+for idx, iou in enumerate(cls_wise_iou):
+  spaces = ' ' * (10-len(class_names[idx]) + 2)
+  print("{}{}{} ".format(class_names[idx], spaces, iou))
+
+
+# Please input a number between 0 to 3647 to pick an image from the dataset
+ind = 346
+
+# Get the prediction mask
+y_pred_mask = make_predictions(y_true_images[ind], y_true_segments[ind])
+
+# Compute the class wise metrics
+iou= class_iou(y_true_segments[ind], y_pred_mask)  
+
+# Overlay the metrics with the images
+display_with_metrics([y_true_images[ind], y_pred_mask, y_true_segments[ind]], iou )
+
+import cv2
+import matplotlib.pyplot as plt
+im1=cv2.imread('/content/pet.jpeg')
+print(im1.shape)
+im2=cv2.imread('/content/pet1.jpg')
+print(im2.shape)
+frame = cv2.resize(im1, (128, 128))
+frame1 = cv2.resize(im2, (128, 128))
+plt.imshow(frame)
+
+frame = np.expand_dims(frame, axis=0)
+frame = frame / 255.0
+mask = model.predict(frame)[0]
+plt.imshow(mask)
+
+plt.imshow(frame1)
+
+frame1 = np.expand_dims(frame1, axis=0)
+frame1 = frame1 / 255.0
+mask1 = model.predict(frame1)[0]
+plt.imshow(mask1)
+
+frame=cv2.imread('/content/smile.jpg')
+H, W, _ = frame.shape
+
+ori_frame = frame
+frame = cv2.resize(frame, (128, 128))
+frame = np.expand_dims(frame, axis=0)
+frame = frame / 255.0
+
+mask = model.predict(frame)[0] 
+mask = mask.astype(np.float32)  
+mask = cv2.resize(mask, (W, H))  
+combine_frame = ori_frame * mask
+combine_frame = combine_frame.astype(np.uint8)
+plt.imshow(combine_frame)
+
+frame=cv2.imread('/content/pet.jpeg')
+H, W, _ = frame.shape
+
+ori_frame = frame
+frame = cv2.resize(frame, (128, 128))
+frame = np.expand_dims(frame, axis=0)
+frame = frame / 255.0
+
+mask = model.predict(frame)[0] 
+mask = mask.astype(np.float32)  
+mask = cv2.resize(mask, (W, H))  
+combine_frame = ori_frame * mask
+combine_frame = combine_frame.astype(np.uint8)
+plt.imshow(combine_frame)
