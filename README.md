@@ -2,7 +2,7 @@
 Here we have done video segmentation and compression as part of video processing. 
 
 ## Run Video Segmentation
-- Run 'python pets_unet.py'. This will generate unet.h5 model.
+- Run `python pets_unet.py`. This will generate unet.h5 model.
 - Then Run 'python VideoC.py'. This will demonstrate video segmentation using live video capturing.
 
 ## Run Video Compression
